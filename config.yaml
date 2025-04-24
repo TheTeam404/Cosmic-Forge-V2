@@ -1,0 +1,102 @@
+# Configuration for LIBS Cosmic Forge
+
+# --- Appearance ---
+default_theme: 'dark_cosmic' # Options: 'dark_cosmic', 'light_science'
+
+plotting:
+  matplotlib_style_dark: 'dark_background'
+  matplotlib_style_light: 'seaborn-v0_8-notebook'
+  # Custom colors (override theme defaults if needed)
+  raw_data_color: 'gray'
+  processed_data_color: 'cyan'
+  baseline_color: 'orange'
+  peak_detected_color: 'red'
+  peak_fitted_color: 'lime' # Edge color for fitted marker
+  fit_line_color: 'magenta' # Default fit line
+  highlight_fit_color: 'yellow' # Highlighted fit line/marker
+  highlight_peak_color: 'yellow' # Highlighted peak selection marker
+  nist_line_colormap: 'tab10' # Colormap for NIST ID lines by element
+
+# --- Processing Defaults ---
+processing:
+  baseline:
+    default_method: 'Polynomial' # Options: 'Polynomial', 'SNIP', 'None'
+    poly_order: 3
+    snip_iterations: 100 # Placeholder
+    percentile: 10.0
+  smoothing:
+    default_method: 'SavitzkyGolay' # Options: 'SavitzkyGolay', 'None'
+    savitzky_golay: { window_length: 11, polyorder: 3 }
+  denoising: # <-- NEW SECTION ADDED
+    default_method: 'Wavelet' # Options: 'Wavelet', 'None'
+    wavelet:
+      wavelet_type: 'db8'   # Default Daubechies wavelet (e.g., 'db4', 'db8', 'sym8', 'coif5')
+      level: 4              # Default decomposition level (adjust based on signal length/noise)
+      mode: 'soft'          # Thresholding mode ('soft' or 'hard')
+      threshold_sigma_factor: 3.0 # Factor times Median Absolute Deviation for threshold
+  noise_analysis: {} # Placeholder
+
+# --- Peak Detection Defaults ---
+peak_detection:
+  default_method: 'ScipyFindPeaks' # Only ScipyFindPeaks currently implemented
+  scipy_find_peaks:
+    rel_height_percent: 5.0
+    min_distance_points: 5
+    width: 0
+    prominence: 0.0
+
+# --- Peak Fitting Defaults ---
+peak_fitting:
+  # profiles_to_fit: ['Gaussian', 'Lorentzian', 'PseudoVoigt'] # Currently hardcoded in fitter
+  roi_factor: 7.0 # Default ROI width = Factor * Est. FWHM
+  min_roi_width_nm: 0.1 # Minimum default ROI width
+  max_iterations: 2000 # Max iterations for scipy.optimize.curve_fit
+  model_selection: 'AIC' # Options: 'AIC', 'BIC'
+  baseline_mode: 'LocalLinear' # Local baseline for fit ROI: 'LocalLinear', 'Slope', 'None'
+
+# --- NIST Search ---
+database: # Section kept for NIST online settings
+  online_search_timeout_s: 15
+  online_query_delay_s: 1.5
+  default_search_tolerance_nm: 0.1 # Default tolerance for NIST search UI panel
+
+# --- CF-LIBS ---
+cflibs:
+  min_lines_for_boltzmann: 3 # Minimum required lines for Boltzmann plot calculation
+  # default_temp_species: 'Fe I' # If needed later
+
+# --- Machine Learning ---
+machine_learning:
+  # Preprocessing defaults for ML View
+  preprocess_baseline_method: 'Polynomial (Linear)' # Limited options for speed? Use 'None' to disable.
+  preprocess_scale_default: true
+  # Default parameters for specific algorithms
+  pca: { default_n_components: 3 }
+  pls: { default_n_components: 5, default_target_wl: 404.58 }
+  RandomForest: { n_estimators: 100 } # Example
+  GBT: { n_estimators: 100, learning_rate: 0.1 } # Example
+
+# --- File IO ---
+file_io:
+  default_delimiter: '\t'
+  default_comment_char: '#'
+  # Default float format for saving CSVs
+  default_float_format: '%.5g' # General format with up to 5 significant digits
+  # remember_last_directory: true # QSettings handles this automatically now
+
+# --- Logging ---
+logging:
+  log_level_console: 'INFO' # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  log_level_file: 'DEBUG'
+  log_dir: 'logs' # Relative to project root
+  log_file_name: 'libs_cosmic_forge.log'
+  log_max_bytes: 5242880 # 5 MB
+  log_backup_count: 4
+  # Optional format override:
+  # log_format: '%(asctime)s - %(levelname)-7s - [%(name)s:%(lineno)d] - %(message)s'
+  # log_date_format: '%Y-%m-%d %H:%M:%S'
+
+# --- Application Settings ---
+application:
+  remember_window_state: true # Save/restore window geometry and dock layout via QSettings
+  # Add other application-wide settings here if needed

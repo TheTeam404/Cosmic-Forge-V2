@@ -1,0 +1,22 @@
+# Core Libraries
+numpy>=1.21
+scipy>=1.8
+pandas>=1.4
+pyyaml>=6.0
+PyWavelets>=1.3 # Added for wavelet denoising
+
+# GUI
+PyQt6>=6.4
+matplotlib>=3.5
+
+# Data Handling & NIST
+astroquery>=0.4.6 # For fetching NIST data online
+astropy>=5.0     # Dependency for astroquery
+
+# Machine Learning (Optional but used in ML view)
+scikit-learn>=1.1
+
+# Add other specific libraries if needed later
+# e.g., lmfit (for advanced fitting)
+# e.g., uncertainties (for error propagation)
+# e.g., pyqtgraph (alternative plotter)
