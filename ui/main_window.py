@@ -1957,7 +1957,7 @@ class MainWindow(QMainWindow):
             # Re-correlate NIST matches (if any exist) to the new fits
             self._correlate_nist_matches_to_peaks()
             if self.plot_widget:
-                 self.plot_widget.plot_nist_matches(self.nist_matches, correlate=False) # Display potentially updated correlations
+                 self.plot_widget.plot_nist_matches(self.nist_matches, clear_previous=False) # Display potentially updated correlations
 
         except Exception as e:
             # Catch errors in the main loop or setup
