@@ -1681,7 +1681,7 @@ class MainWindow(QMainWindow):
                 self.update_status(f"Loading {i+1}/{len(filepaths)}: {os.path.basename(fp)}...", 0)
                 QApplication.processEvents() # Keep UI responsive
                 try:
-                    spectrum = load_spectrum_from_file(fp, delimiter=delimiter, comment=comment)
+                    spectrum = load_spectrum_from_file(fp, delimiter=delimiter)
                     loaded_spectra.append(spectrum)
                 except Exception as e:
                     error_msg = f"'{os.path.basename(fp)}': {e}"
