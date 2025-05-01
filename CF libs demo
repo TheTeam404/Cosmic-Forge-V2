@@ -1,0 +1,1232 @@
+# === FILE START: cf_libs_demo_gui.py ===
+# -*- coding: utf-8 -*-
+"""
+Standalone GUI Demonstration for Calibration-Free LIBS (CF-LIBS).
+
+Illustrates the basic workflow: Boltzmann Plot for Te, followed by
+Saha-Boltzmann calculations for elemental concentrations.
+
+**IMPORTANT ASSUMPTIONS/SIMPLIFICATIONS:**
+- Local Thermodynamic Equilibrium (LTE) is assumed.
+- Plasma is assumed optically thin (no self-absorption correction).
+- Correct line identification and intensities are provided by the user.
+- Accurate atomic data (E_k, g_k, A_ki, IE, U) is provided.
+- Electron Density (Ne) is provided as input (no Stark broadening calculation).
+- Partition Functions (U) are provided as input for the relevant temperature.
+"""
+
+import numpy as np
+import math
+import logging # Keep this import here
+import sys
+import tkinter as tk
+from tkinter import ttk, simpledialog, messagebox, scrolledtext
+from typing import Dict, Any, List, Optional, Tuple
+import collections
+
+# --- Basic Logging Setup --- # <<< Logger Configuration Moved Here
+log = logging.getLogger("CFLIBSDemo") # Define the logger instance first
+log.setLevel(logging.INFO) # Set root logger level
+formatter = logging.Formatter('%(asctime)s - %(levelname)-7s - %(message)s', datefmt='%H:%M:%S')
+# Console handler
+ch = logging.StreamHandler()
+ch.setFormatter(formatter)
+log.addHandler(ch)
+# GUI handler will be added later in the App's __init__
+
+# --- Dependency Checks & Matplotlib Setup ---
+_NUMPY_AVAILABLE = True
+_SCIPY_AVAILABLE = False # Needed for linregress
+
+try:
+    from scipy import stats as sp_stats
+    _SCIPY_AVAILABLE = True
+    log.info("SciPy found (used for linear regression).") # Now 'log' is defined
+except ImportError:
+    log.critical("SciPy not found ('pip install scipy'). Required for Boltzmann plot fitting.")
+    # Can't proceed without SciPy for this demo
+    sys.exit("Error: SciPy is required for linear regression in this demo.")
+
+
+try:
+    import matplotlib
+    matplotlib.use('TkAgg') # Essential for Tkinter embedding
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+    _MATPLOTLIB_AVAILABLE = True
+    log.info("Matplotlib found and configured for TkAgg.")
+except ImportError:
+    _MATPLOTLIB_AVAILABLE = False
+    log.critical("Matplotlib not found ('pip install matplotlib'). GUI cannot function.")
+    sys.exit("Error: Matplotlib is required for this GUI demo.")
+
+# --- GUI Log Handler Class ---
+class GuiHandler(logging.Handler):
+    """Custom logging handler to write logs to the GUI Text widget."""
+    def __init__(self, text_widget):
+        logging.Handler.__init__(self)
+        self.text_widget = text_widget
+        self.queue = collections.deque() # Queue messages
+        self.is_scheduled = False
+
+    def emit(self, record):
+        msg = self.format(record)
+        self.queue.append(msg)
+        if not self.is_scheduled:
+            self.is_scheduled = True
+            # Schedule processing the queue
+            try:
+                 if self.text_widget and self.text_widget.winfo_exists():
+                      self.text_widget.after(100, self.process_queue) # Process queue periodically
+            except Exception:
+                 self.is_scheduled = False # Reschedule might fail if widget gone
+
+
+    def process_queue(self):
+         """Process all messages currently in the queue."""
+         try:
+              if not (self.text_widget and self.text_widget.winfo_exists()):
+                  self.is_scheduled = False
+                  self.queue.clear() # Don't process if widget gone
+                  return
+
+              self.text_widget.configure(state='normal')
+              while self.queue:
+                   msg = self.queue.popleft()
+                   self.text_widget.insert(tk.END, msg + '\n')
+              self.text_widget.configure(state='disabled')
+              self.text_widget.yview(tk.END) # Auto-scroll
+         except Exception as e:
+              # Log error processing queue (maybe to console?)
+              print(f"Error processing log queue: {e}")
+         finally:
+              self.is_scheduled = False # Ready for next scheduling
+
+
+# --- Physical Constants ---
+# Using values from NIST CODATA 2018
+k_B_eV = 8.617333262e-5   # Boltzmann constant in eV/K
+k_B_J = 1.380649e-23       # Boltzmann constant in J/K
+h_Js = 6.62607015e-34      # Planck constant in J*s
+c_mps = 299792458          # Speed of light in m/s
+e_C = 1.602176634e-19      # Elementary charge in C
+m_e_kg = 9.1093837015e-31  # Electron mass in kg
+
+# Pre-calculated constant for Saha equation (units consistent with N in cm⁻³, T in K, IE in eV)
+SAHA_CONST_CM3 = 2 * ( (2 * np.pi * m_e_kg * k_B_J) / (h_Js**2) )**(3/2) / 1e6 # units K^(-3/2) cm⁻³
+log.info(f"Using Saha Constant Factor (for N in cm^-3, T in K, IE in eV): {SAHA_CONST_CM3:.4e} K^(-3/2) cm^-3")
+# Formula used: Ne * N_{i+1}/N_i = SAHA_CONST_CM3 * T^(3/2) * (U_{i+1}/U_i) * exp(-IE_eV / (k_B_eV * T))
+
+
+# --- Main Application Class ---
+class CFLIBSDemoApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("CF-LIBS Demo GUI")
+        self.geometry("1150x800")
+
+        # --- Data Storage ---
+        self.line_data: List[Dict[str, Any]] = [] # Store lines as list of dicts
+        self.elements_params: Dict[str, Dict[str, Any]] = {} # Store IE and U for elements
+        self.plasma_params: Dict[str, Optional[float]] = {
+            "Te": None, # Plasma Temperature (K)
+            "Ne": None  # Electron Density (cm^-3) - User Input
+        }
+        self.cf_results: Dict[str, float] = {} # Store calculated concentrations
+
+        # --- GUI Setup ---
+        self.create_widgets() # This creates self.log_text
+
+        # --- Logger Setup (needs self.log_text) ---
+        if hasattr(self, 'log_text'):
+            self.log_handler = GuiHandler(self.log_text)
+            self.log_handler.setFormatter(formatter)
+            log.addHandler(self.log_handler)
+            log.info("CF-LIBS Demo GUI Initialized.")
+        else:
+            # This should not happen if create_widgets runs first
+            log.error("Log widget not created before logger init.")
+
+        # --- Load Sample Data on Start ---
+        self.load_sample_data()
+
+        # Handle window close
+        self.protocol("WM_DELETE_WINDOW", self.quit_app)
+
+
+    def create_widgets(self):
+        # --- Main Layout Frames ---
+        # Top frame for inputs (lines, plasma params)
+        input_frame = ttk.Frame(self, padding="5")
+        input_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
+
+        # Bottom frame for plot and results/log
+        output_frame = ttk.Frame(self, padding="5")
+        output_frame.pack(side=tk.BOTTOM, fill=tk.BOTH, expand=True, padx=5, pady=5)
+        output_frame.columnconfigure(0, weight=1) # Plot area
+        output_frame.columnconfigure(1, weight=1) # Results/Log area
+        output_frame.rowconfigure(0, weight=1)
+
+        # --- Input Area (Left Side of Top Frame) ---
+        line_input_frame = ttk.LabelFrame(input_frame, text="Spectral Line Data", padding="5")
+        line_input_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
+
+        # Treeview for line data display and editing
+        cols = ("Element", "Stage", "Wavelength", "Intensity", "Ek (eV)", "gk", "Aki (s^-1)")
+        self.line_tree = ttk.Treeview(line_input_frame, columns=cols, show='headings', height=10)
+        for col in cols:
+            self.line_tree.heading(col, text=col)
+            self.line_tree.column(col, width=85, anchor='center', stretch=False) # Adjust widths
+        self.line_tree.column("Wavelength", width=100)
+        self.line_tree.column("Aki (s^-1)", width=100)
+        self.line_tree.column("Intensity", width=100) # Wider for scientific notation
+
+        # Scrollbars for Treeview
+        tree_ysb = ttk.Scrollbar(line_input_frame, orient=tk.VERTICAL, command=self.line_tree.yview)
+        tree_xsb = ttk.Scrollbar(line_input_frame, orient=tk.HORIZONTAL, command=self.line_tree.xview)
+        self.line_tree.configure(yscrollcommand=tree_ysb.set, xscrollcommand=tree_xsb.set)
+
+        self.line_tree.grid(row=0, column=0, sticky='nsew')
+        tree_ysb.grid(row=0, column=1, sticky='ns')
+        tree_xsb.grid(row=1, column=0, sticky='ew')
+        line_input_frame.grid_rowconfigure(0, weight=1)
+        line_input_frame.grid_columnconfigure(0, weight=1)
+
+        # Buttons for line data manipulation
+        line_button_frame = ttk.Frame(line_input_frame)
+        line_button_frame.grid(row=2, column=0, columnspan=2, pady=(5, 0))
+        ttk.Button(line_button_frame, text="Add Line", command=self.add_line_popup).pack(side=tk.LEFT, padx=2)
+        ttk.Button(line_button_frame, text="Edit Selected", command=self.edit_selected_line).pack(side=tk.LEFT, padx=2)
+        ttk.Button(line_button_frame, text="Delete Selected", command=self.delete_selected_line).pack(side=tk.LEFT, padx=2)
+        ttk.Button(line_button_frame, text="Clear All Lines", command=self.clear_line_data).pack(side=tk.LEFT, padx=2)
+        ttk.Button(line_button_frame, text="Load Sample", command=self.load_sample_data).pack(side=tk.LEFT, padx=2)
+
+        # --- Parameters Input Area (Right Side of Top Frame) ---
+        param_input_frame = ttk.LabelFrame(input_frame, text="Plasma & Atomic Parameters", padding="5")
+        param_input_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(5, 0))
+
+        # Electron Density Input
+        ttk.Label(param_input_frame, text="Electron Density Ne (cm⁻³):").grid(row=0, column=0, sticky='w', padx=5, pady=2)
+        self.ne_var = tk.StringVar(value="1.0e17") # Default typical value
+        ne_entry = ttk.Entry(param_input_frame, textvariable=self.ne_var, width=15)
+        ne_entry.grid(row=0, column=1, sticky='ew', padx=5, pady=2)
+
+        ttk.Separator(param_input_frame, orient='horizontal').grid(row=1, column=0, columnspan=2, sticky='ew', pady=5)
+
+        # Frame for element-specific parameters (Ionization Energy, Partition Functions)
+        ttk.Label(param_input_frame, text="Element Parameters (IE in eV):").grid(row=2, column=0, columnspan=2, sticky='w', padx=5, pady=(5, 2))
+        self.element_param_frame = ttk.Frame(param_input_frame)
+        self.element_param_frame.grid(row=3, column=0, columnspan=2, sticky='nsew')
+        # Content will be populated dynamically based on elements in line data
+
+        # --- Plot Area (Left Side of Bottom Frame) ---
+        plot_frame = ttk.LabelFrame(output_frame, text="Plot Area", padding="5")
+        plot_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+        plot_frame.rowconfigure(0, weight=1)
+        plot_frame.columnconfigure(0, weight=1)
+
+        self.fig = Figure(figsize=(6, 5), dpi=100)
+        self.ax = self.fig.add_subplot(111)
+        self.ax.set_title("Boltzmann Plot will appear here")
+        self.ax.grid(True, linestyle=':')
+
+        self.canvas = FigureCanvasTkAgg(self.fig, master=plot_frame)
+        self.canvas_widget = self.canvas.get_tk_widget()
+        self.canvas_widget.grid(row=0, column=0, sticky="nsew")
+
+        # Matplotlib Navigation Toolbar
+        toolbar_frame = ttk.Frame(plot_frame)
+        toolbar_frame.grid(row=1, column=0, sticky="ew")
+        toolbar = NavigationToolbar2Tk(self.canvas, toolbar_frame)
+        toolbar.update()
+
+        # --- Results & Log Area (Right Side of Bottom Frame) ---
+        results_log_frame = ttk.Frame(output_frame)
+        results_log_frame.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
+        results_log_frame.rowconfigure(1, weight=1) # Log area expands
+        results_log_frame.columnconfigure(0, weight=1)
+
+        # Calculation Controls and Results Display Frame
+        calc_results_frame = ttk.LabelFrame(results_log_frame, text="Calculations & Results", padding="5")
+        calc_results_frame.grid(row=0, column=0, sticky="new", pady=(0, 5))
+        calc_results_frame.columnconfigure(1, weight=1) # Make result labels expand
+
+        # Boltzmann Plot Button
+        ttk.Button(calc_results_frame, text="Calculate Te (Boltzmann Plot)", command=self.run_boltzmann_plot).grid(row=0, column=0, padx=5, pady=5, sticky='w')
+        ttk.Label(calc_results_frame, text="Temp (Te):").grid(row=0, column=1, sticky='e', padx=(10,2))
+        self.te_result_var = tk.StringVar(value="N/A")
+        ttk.Label(calc_results_frame, textvariable=self.te_result_var, relief="sunken", width=15, anchor='w').grid(row=0, column=2, sticky='ew', padx=(0,5))
+
+        # CF-LIBS Calculation Button
+        ttk.Button(calc_results_frame, text="Calculate Concentrations (CF-LIBS)", command=self.run_cf_libs_calculation).grid(row=1, column=0, padx=5, pady=5, sticky='w')
+
+        # Area for Concentration Results (populate dynamically)
+        self.concentration_frame = ttk.Frame(calc_results_frame, padding=(0, 5))
+        self.concentration_frame.grid(row=2, column=0, columnspan=3, sticky='nsew', padx=5)
+        # Initial placeholder
+        ttk.Label(self.concentration_frame, text="Concentrations will appear here.").pack(anchor='w')
+
+
+        # Log Area Frame
+        log_frame = ttk.LabelFrame(results_log_frame, text="Status Log", padding="5")
+        log_frame.grid(row=1, column=0, sticky="nsew")
+        log_frame.rowconfigure(0, weight=1)
+        log_frame.columnconfigure(0, weight=1)
+
+        self.log_text = scrolledtext.ScrolledText(log_frame, height=10, state='disabled', wrap=tk.WORD, font=("Consolas", 9))
+        self.log_text.pack(fill=tk.BOTH, expand=True) # Use pack for simplicity inside this frame
+
+        # --- Bottom Quit Button ---
+        quit_button = ttk.Button(self, text="Quit", command=self.quit_app, width=10)
+        quit_button.pack(side=tk.BOTTOM, pady=5)
+
+
+    # --- Data Handling Methods ---
+
+    def populate_element_params_frame(self):
+        """ Dynamically create labels/entries for IE and U based on elements found """
+        # Clear existing widgets
+        for widget in self.element_param_frame.winfo_children():
+            widget.destroy()
+
+        # Header
+        ttk.Label(self.element_param_frame, text="Element", font='TkDefaultFont 9 bold').grid(row=0, column=0, padx=2, sticky='w')
+        ttk.Label(self.element_param_frame, text="IE_I (eV)", font='TkDefaultFont 9 bold').grid(row=0, column=1, padx=2)
+        ttk.Label(self.element_param_frame, text="U_I", font='TkDefaultFont 9 bold').grid(row=0, column=2, padx=2)
+        ttk.Label(self.element_param_frame, text="IE_II (eV)", font='TkDefaultFont 9 bold').grid(row=0, column=3, padx=2)
+        ttk.Label(self.element_param_frame, text="U_II", font='TkDefaultFont 9 bold').grid(row=0, column=4, padx=2)
+        # Add U_III header if needed
+
+        elements = sorted(list(set(line.get('Element','').strip() for line in self.line_data if line.get('Element','').strip()))) # Get unique, non-empty elements
+        self.element_param_vars = {} # Store the tk.StringVar references
+
+        for i, el in enumerate(elements):
+            if not el: continue # Skip if element symbol somehow became empty
+            row_idx = i + 1
+            self.element_param_vars[el] = {}
+
+            # Get current/default values or empty string
+            el_params = self.elements_params.get(el, {})
+
+            # Element Label
+            ttk.Label(self.element_param_frame, text=el).grid(row=row_idx, column=0, sticky='w', padx=(5,2))
+
+            # IE_I
+            ie1_var = tk.StringVar(value=str(el_params.get('IE_I', '')))
+            ttk.Entry(self.element_param_frame, textvariable=ie1_var, width=7).grid(row=row_idx, column=1, padx=2)
+            self.element_param_vars[el]['IE_I'] = ie1_var
+
+            # U_I
+            u1_var = tk.StringVar(value=str(el_params.get('U_I', '')))
+            ttk.Entry(self.element_param_frame, textvariable=u1_var, width=7).grid(row=row_idx, column=2, padx=2)
+            self.element_param_vars[el]['U_I'] = u1_var
+
+            # IE_II
+            ie2_var = tk.StringVar(value=str(el_params.get('IE_II', '')))
+            ttk.Entry(self.element_param_frame, textvariable=ie2_var, width=7).grid(row=row_idx, column=3, padx=2)
+            self.element_param_vars[el]['IE_II'] = ie2_var
+
+            # U_II
+            u2_var = tk.StringVar(value=str(el_params.get('U_II', '')))
+            ttk.Entry(self.element_param_frame, textvariable=u2_var, width=7).grid(row=row_idx, column=4, padx=2)
+            self.element_param_vars[el]['U_II'] = u2_var
+
+            # Add U_III entry if needed for higher stages
+
+    def update_element_params_from_gui(self):
+        """ Reads the values from the element parameter entries and updates storage """
+        updated_params = {}
+        elements = sorted(list(set(line.get('Element','').strip() for line in self.line_data if line.get('Element','').strip())))
+        if not elements: # No elements if no lines
+            self.elements_params = {}
+            return True
+
+        for el in elements:
+             if not el: continue
+             if el not in self.element_param_vars:
+                 log.warning(f"Element {el} found in lines but parameter widgets not found. Re-populating.")
+                 self.populate_element_params_frame() # Attempt to refresh widgets
+                 if el not in self.element_param_vars: # Still not there? Error.
+                     log.error(f"Failed to find/create parameter widgets for element {el}.")
+                     messagebox.showerror("GUI Error", f"Could not access parameter fields for element {el}.", parent=self)
+                     return False # Critical GUI state issue
+             el_data = {}
+             try:
+                  # Parse IE_I
+                  ie1_str = self.element_param_vars[el]['IE_I'].get().strip()
+                  el_data['IE_I'] = float(ie1_str) if ie1_str else None
+                  # Parse U_I
+                  u1_str = self.element_param_vars[el]['U_I'].get().strip()
+                  el_data['U_I'] = float(u1_str) if u1_str else None
+                  # Parse IE_II
+                  ie2_str = self.element_param_vars[el]['IE_II'].get().strip()
+                  el_data['IE_II'] = float(ie2_str) if ie2_str else None
+                   # Parse U_II
+                  u2_str = self.element_param_vars[el]['U_II'].get().strip()
+                  el_data['U_II'] = float(u2_str) if u2_str else None
+                  # Add U_III etc.
+
+                  # Basic validation during parsing (more thorough checks in validate_cf_inputs)
+                  if el_data['IE_I'] is not None and el_data['IE_I'] <= 0: raise ValueError("IE_I must be positive")
+                  if el_data['U_I'] is not None and el_data['U_I'] <= 0: raise ValueError("U_I must be positive")
+                  if el_data['IE_II'] is not None and el_data['IE_II'] <= 0: raise ValueError("IE_II must be positive")
+                  if el_data['U_II'] is not None and el_data['U_II'] <= 0: raise ValueError("U_II must be positive")
+
+                  updated_params[el] = el_data
+             except ValueError as e:
+                  log.error(f"Invalid numeric value entered for element {el} parameters: {e}")
+                  messagebox.showerror("Input Error", f"Invalid number entered for parameters of element {el}.\n({e})", parent=self)
+                  return False # Indicate failure
+             except KeyError as e:
+                  log.error(f"Missing parameter key for element {el}: {e}. GUI state might be inconsistent.")
+                  messagebox.showerror("GUI Error", f"Error accessing parameter field for {el}.\nTry reloading sample data.", parent=self)
+                  return False
+        self.elements_params = updated_params
+        log.debug("Element parameters updated from GUI.")
+        return True # Indicate success
+
+
+    def add_line_popup(self):
+        """ Opens a dialog to add a new line """
+        dialog = LineInputDialog(self, title="Add Spectral Line")
+        if dialog.result:
+             # Validate types (simple validation)
+             try:
+                  line = {
+                       "Element": str(dialog.result["Element"]).strip().capitalize(), # Capitalize element
+                       "Stage": int(dialog.result["Stage"]),
+                       "Wavelength": float(dialog.result["Wavelength"]),
+                       "Intensity": float(dialog.result["Intensity"]),
+                       "Ek (eV)": float(dialog.result["Ek (eV)"]),
+                       "gk": float(dialog.result["gk"]),
+                       "Aki (s^-1)": float(dialog.result["Aki (s^-1)"])
+                  }
+                  # Basic sanity checks
+                  if not line["Element"]: raise ValueError("Element symbol cannot be empty.")
+                  if line["Stage"] < 1: raise ValueError("Ionization Stage must be >= 1 (1=neutral, 2=+, etc.).")
+                  if line["Wavelength"] <= 0: raise ValueError("Wavelength must be positive.")
+                  if line["Intensity"] <= 0: raise ValueError("Intensity must be positive.")
+                  if line["Ek (eV)"] < 0: raise ValueError("Ek cannot be negative.")
+                  if line["gk"] <= 0: raise ValueError("gk must be positive.")
+                  if line["Aki (s^-1)"] <= 0: raise ValueError("Aki must be positive.")
+
+                  self.line_data.append(line)
+                  self.update_line_treeview() # This calls populate_element_params_frame
+                  log.info(f"Added line for {line['Element']} {line['Stage']} at {line['Wavelength']:.3f} nm.")
+             except ValueError as e:
+                  log.error(f"Invalid data entered for line: {e}")
+                  messagebox.showerror("Invalid Input", f"Invalid data entered:\n{e}", parent=self)
+
+
+    def edit_selected_line(self):
+        """ Opens dialog to edit the selected line """
+        selected_iid = self.line_tree.focus() # Get selected item ID
+        if not selected_iid:
+             messagebox.showwarning("No Selection", "Please select a line in the table to edit.", parent=self)
+             return
+
+        try:
+            item_index = self.line_tree.index(selected_iid)
+            # Ensure index is valid before accessing data
+            if item_index < 0 or item_index >= len(self.line_data):
+                 log.error(f"Invalid index ({item_index}) obtained for selected item {selected_iid}.")
+                 return
+            current_data = self.line_data[item_index]
+        except Exception as e:
+             log.error(f"Error getting selected line data: {e}", exc_info=True)
+             messagebox.showerror("Error", "Could not retrieve data for the selected line.", parent=self)
+             return
+
+        dialog = LineInputDialog(self, title="Edit Spectral Line", initial_data=current_data)
+        if dialog.result:
+             # Validate and update
+             try:
+                  updated_line = {
+                       "Element": str(dialog.result["Element"]).strip().capitalize(),
+                       "Stage": int(dialog.result["Stage"]),
+                       "Wavelength": float(dialog.result["Wavelength"]),
+                       "Intensity": float(dialog.result["Intensity"]),
+                       "Ek (eV)": float(dialog.result["Ek (eV)"]),
+                       "gk": float(dialog.result["gk"]),
+                       "Aki (s^-1)": float(dialog.result["Aki (s^-1)"])
+                  }
+                   # Basic sanity checks (same as add)
+                  if not updated_line["Element"]: raise ValueError("Element symbol cannot be empty.")
+                  if updated_line["Stage"] < 1: raise ValueError("Ionization Stage must be >= 1.")
+                  if updated_line["Wavelength"] <= 0: raise ValueError("Wavelength must be positive.")
+                  if updated_line["Intensity"] <= 0: raise ValueError("Intensity must be positive.")
+                  if updated_line["Ek (eV)"] < 0: raise ValueError("Ek cannot be negative.")
+                  if updated_line["gk"] <= 0: raise ValueError("gk must be positive.")
+                  if updated_line["Aki (s^-1)"] <= 0: raise ValueError("Aki must be positive.")
+
+                  self.line_data[item_index] = updated_line
+                  self.update_line_treeview() # Updates element params frame too
+                  log.info(f"Updated line for {updated_line['Element']} {updated_line['Stage']} at {updated_line['Wavelength']:.3f} nm.")
+             except ValueError as e:
+                  log.error(f"Invalid data entered during edit: {e}")
+                  messagebox.showerror("Invalid Input", f"Invalid data entered during edit:\n{e}", parent=self)
+
+    def delete_selected_line(self):
+        """ Deletes the selected line(s) from the table """
+        selected_iids = self.line_tree.selection() # Get tuple of selected item IDs
+        if not selected_iids:
+             messagebox.showwarning("No Selection", "Please select line(s) in the table to delete.", parent=self)
+             return
+
+        # Confirm deletion
+        if not messagebox.askyesno("Confirm Delete", f"Delete {len(selected_iids)} selected line(s)?", parent=self):
+             return
+
+        # Need to delete from underlying list carefully (indices change)
+        # Get indices *before* deleting, handle potential errors getting index
+        indices_to_delete = []
+        valid_iids = []
+        for iid in selected_iids:
+             try:
+                  index = self.line_tree.index(iid)
+                  if 0 <= index < len(self.line_data): # Check if index is still valid
+                    indices_to_delete.append(index)
+                    valid_iids.append(iid) # Keep track of iids actually used
+             except Exception:
+                 log.warning(f"Could not get index for selected item {iid}, skipping.")
+
+        # Sort indices in reverse order for safe deletion
+        indices_to_delete.sort(reverse=True)
+
+        deleted_count = 0
+        for index in indices_to_delete:
+            try:
+                del self.line_data[index]
+                deleted_count += 1
+            except IndexError:
+                 log.warning(f"Index {index} out of bounds during deletion, possibly due to inconsistent state.")
+
+
+        self.update_line_treeview() # Refreshes treeview and element params frame
+        if deleted_count > 0:
+            log.info(f"Deleted {deleted_count} line(s).")
+        else:
+            log.warning("No lines were deleted (indices might have been invalid).")
+
+
+    def clear_line_data(self):
+        """ Clears all lines from the data and treeview """
+        if not messagebox.askyesno("Confirm Clear", "Clear all spectral line data and element parameters?", parent=self):
+            return
+        self.line_data = []
+        self.elements_params = {} # Clear element params too
+        self.update_line_treeview() # Also updates element params frame
+        self.clear_results()
+        log.info("Cleared all spectral line data and element parameters.")
+
+    def update_line_treeview(self):
+        """ Clears and repopulates the treeview from self.line_data """
+        # Clear existing items
+        for item in self.line_tree.get_children():
+            try:
+                 self.line_tree.delete(item)
+            except tk.TclError:
+                 log.warning(f"Ignoring error deleting treeview item {item}, might already be gone.")
+
+
+        # Insert new data
+        for i, line in enumerate(self.line_data):
+            # Format values for display if needed
+            try:
+                values = (
+                    line.get("Element", "N/A"),
+                    line.get("Stage", "N/A"),
+                    f"{line.get('Wavelength', 0):.3f}",
+                    f"{line.get('Intensity', 0):.3e}", # Scientific notation for Intensity
+                    f"{line.get('Ek (eV)', 0):.4f}",
+                    f"{line.get('gk', 0):.1f}",
+                    f"{line.get('Aki (s^-1)', 0):.3e}",
+                )
+                self.line_tree.insert('', tk.END, iid=str(i), values=values, tags=('line_row',)) # Use index as IID
+            except Exception as e:
+                 log.error(f"Error formatting line {i} for treeview: {line} - {e}")
+                 # Insert placeholder row to indicate error
+                 self.line_tree.insert('', tk.END, iid=str(i), values=("Error",)*7, tags=('error_row',))
+
+        # Configure tag styles (optional, for highlighting errors)
+        self.line_tree.tag_configure('error_row', background='pink', foreground='red')
+        self.line_tree.tag_configure('line_row', background='white') # Ensure default
+
+
+        # Update the element parameters frame based on the current elements
+        self.populate_element_params_frame()
+
+    def load_sample_data(self):
+        """ Loads sample data into the line list and parameter fields """
+        log.info("Loading sample spectral line and parameter data...")
+        # Sample data structure: list of dictionaries
+        # Wavelength (nm), Element, Stage (1=Neutral, 2=+), Intensity (arb.), Ek (eV), gk, Aki (s^-1)
+        # NOTE: These values are examples, use accurate data (e.g., from NIST ASD) for real work!
+        sample_lines = [
+            # Fe I (Neutral Iron)
+            {'Wavelength': 373.713, 'Element': 'Fe', 'Stage': 1, 'Intensity': 1.5e4, 'Ek (eV)': 3.332, 'gk': 9.0, 'Aki (s^-1)': 1.80e8},
+            {'Wavelength': 382.043, 'Element': 'Fe', 'Stage': 1, 'Intensity': 1.2e4, 'Ek (eV)': 3.211, 'gk': 11.0, 'Aki (s^-1)': 1.16e8},
+            {'Wavelength': 404.581, 'Element': 'Fe', 'Stage': 1, 'Intensity': 1.8e4, 'Ek (eV)': 3.047, 'gk': 7.0, 'Aki (s^-1)': 8.68e7},
+            {'Wavelength': 438.354, 'Element': 'Fe', 'Stage': 1, 'Intensity': 2.5e4, 'Ek (eV)': 1.485, 'gk': 5.0, 'Aki (s^-1)': 6.92e7},
+            {'Wavelength': 526.954, 'Element': 'Fe', 'Stage': 1, 'Intensity': 3.0e4, 'Ek (eV)': 0.915, 'gk': 7.0, 'Aki (s^-1)': 1.02e7},
+            # Fe II (Singly Ionized Iron)
+            {'Wavelength': 238.204, 'Element': 'Fe', 'Stage': 2, 'Intensity': 4.5e4, 'Ek (eV)': 5.203, 'gk': 10.0, 'Aki (s^-1)': 3.13e8},
+            {'Wavelength': 259.940, 'Element': 'Fe', 'Stage': 2, 'Intensity': 5.5e4, 'Ek (eV)': 4.770, 'gk': 8.0, 'Aki (s^-1)': 2.37e8},
+            {'Wavelength': 275.573, 'Element': 'Fe', 'Stage': 2, 'Intensity': 4.0e4, 'Ek (eV)': 4.499, 'gk': 6.0, 'Aki (s^-1)': 1.08e8},
+            # Ca I (Neutral Calcium)
+            {'Wavelength': 422.673, 'Element': 'Ca', 'Stage': 1, 'Intensity': 6.0e4, 'Ek (eV)': 2.933, 'gk': 3.0, 'Aki (s^-1)': 2.18e8},
+            {'Wavelength': 612.222, 'Element': 'Ca', 'Stage': 1, 'Intensity': 2.0e4, 'Ek (eV)': 1.886, 'gk': 5.0, 'Aki (s^-1)': 3.80e7},
+            # Ca II (Singly Ionized Calcium)
+            {'Wavelength': 393.366, 'Element': 'Ca', 'Stage': 2, 'Intensity': 9.0e4, 'Ek (eV)': 3.151, 'gk': 4.0, 'Aki (s^-1)': 1.47e8}, # Ca II K line
+            {'Wavelength': 396.847, 'Element': 'Ca', 'Stage': 2, 'Intensity': 7.5e4, 'Ek (eV)': 3.123, 'gk': 2.0, 'Aki (s^-1)': 1.39e8}, # Ca II H line
+            # Mg I (Neutral Magnesium) - Add one for variety
+            {'Wavelength': 285.213, 'Element': 'Mg', 'Stage': 1, 'Intensity': 8.5e4, 'Ek (eV)': 4.346, 'gk': 3.0, 'Aki (s^-1)': 4.95e8},
+        ]
+        self.line_data = sample_lines
+
+        # Sample Element Parameters (User should verify/replace these!)
+        # Partition functions depend strongly on T, these are placeholders (e.g., for T~1 eV)
+        # Using values roughly from NIST Partition Function calculator online for Te=11604 K (1 eV)
+        sample_element_params = {
+            "Fe": {"IE_I": 7.9024, "U_I": 26.4, "IE_II": 16.1877, "U_II": 31.7},
+            "Ca": {"IE_I": 6.1132, "U_I": 1.32,  "IE_II": 11.8717, "U_II": 2.34},
+            "Mg": {"IE_I": 7.6462, "U_I": 1.0,  "IE_II": 15.0353, "U_II": 2.0},
+        }
+        self.elements_params = sample_element_params
+
+        # Default Ne
+        self.ne_var.set("1.0e17")
+
+        # Update GUI components
+        self.update_line_treeview() # This also updates element params frame
+        self.clear_results()
+        log.info("Sample data loaded into GUI.")
+
+    def clear_results(self):
+        """ Clears calculated results (Te, concentrations) and plot """
+        self.plasma_params["Te"] = None
+        self.te_result_var.set("N/A")
+        self.cf_results = {}
+        # Clear concentration frame
+        for widget in self.concentration_frame.winfo_children():
+            widget.destroy()
+        ttk.Label(self.concentration_frame, text="Concentrations will appear here.").pack(anchor='w') # Restore placeholder
+        # Clear plot
+        self.ax.clear()
+        self.ax.set_title("Ready for Calculation")
+        self.ax.set_xlabel("") # Clear labels
+        self.ax.set_ylabel("")
+        self.ax.grid(True, linestyle=':')
+        self.canvas.draw_idle()
+        log.debug("Results and plot cleared.")
+
+
+    # --- Calculation Methods ---
+
+    def run_boltzmann_plot(self):
+        """ Calculates Te from selected species using Boltzmann plot method """
+        log.info("--- Starting Boltzmann Plot Calculation ---")
+        # Clear only Te result and plot, keep Ne and concentrations if they exist
+        self.plasma_params["Te"] = None
+        self.te_result_var.set("Calculating...")
+        self.ax.clear()
+        self.ax.set_title("Calculating Te...")
+        self.canvas.draw_idle()
+        self.update() # Force redraw
+
+        # 1. Get line data from treeview
+        current_lines = self.line_data
+        if not current_lines:
+            log.error("No spectral line data available.")
+            messagebox.showerror("Error", "No spectral line data loaded.", parent=self)
+            self.te_result_var.set("Error")
+            self.ax.set_title("Error: No line data")
+            self.canvas.draw_idle()
+            return
+
+        # 2. Get unique Species (Element + Stage) available
+        species_list = sorted(list(set(f"{line['Element']} {line['Stage']}" for line in current_lines if line.get('Element') and line.get('Stage'))))
+        if not species_list:
+            log.error("Cannot determine species from line data.")
+            self.te_result_var.set("Error")
+            self.ax.set_title("Error: No species found")
+            self.canvas.draw_idle()
+            return
+
+        # 3. Ask user to select species for Boltzmann plot
+        species_dialog = SelectSpeciesDialog(self, title="Select Species for Boltzmann Plot", options=species_list)
+        selected_species_str = species_dialog.result
+        if not selected_species_str or selected_species_str == "N/A":
+             log.info("Boltzmann plot cancelled by user.")
+             self.te_result_var.set("Cancelled")
+             self.ax.set_title("Cancelled")
+             self.canvas.draw_idle()
+             return
+
+        try:
+            selected_element, selected_stage_str = selected_species_str.split()
+            selected_stage = int(selected_stage_str)
+        except Exception:
+             log.error(f"Invalid species format selected: {selected_species_str}")
+             messagebox.showerror("Error", f"Invalid species format '{selected_species_str}'.", parent=self)
+             self.te_result_var.set("Error")
+             return
+
+        log.info(f"Calculating Te using species: {selected_element} Stage {selected_stage}")
+
+        # 4. Filter lines for the selected species
+        species_lines = [line for line in current_lines if line.get('Element') == selected_element and line.get('Stage') == selected_stage]
+
+        # 5. Check if enough lines are available
+        min_lines_for_fit = 3
+        if len(species_lines) < min_lines_for_fit:
+            log.error(f"Insufficient lines ({len(species_lines)}) for {selected_species_str} to perform Boltzmann plot (need at least {min_lines_for_fit}).")
+            messagebox.showerror("Error", f"Need at least {min_lines_for_fit} spectral lines for {selected_species_str}\nto create a Boltzmann plot.", parent=self)
+            self.te_result_var.set("Error")
+            self.ax.set_title(f"Error: Need >= {min_lines_for_fit} lines")
+            self.canvas.draw_idle()
+            return
+
+        # 6. Prepare data for Boltzmann plot: x = E_k (eV), y = ln(I * lambda / (gk * Aki))
+        boltzmann_x = []
+        boltzmann_y = []
+        valid_lines_info = [] # Store info for plotting labels/tooltips later if needed
+        for i, line in enumerate(species_lines):
+            try:
+                wavelength_nm = float(line['Wavelength'])
+                intensity = float(line['Intensity'])
+                ek_ev = float(line['Ek (eV)'])
+                gk = float(line['gk'])
+                aki = float(line['Aki (s^-1)'])
+
+                # More robust check for valid numeric inputs
+                if not (isinstance(wavelength_nm, (int, float)) and wavelength_nm > 0 and
+                        isinstance(intensity, (int, float)) and intensity > 0 and
+                        isinstance(ek_ev, (int, float)) and ek_ev >= 0 and
+                        isinstance(gk, (int, float)) and gk > 0 and
+                        isinstance(aki, (int, float)) and aki > 0):
+                     log.warning(f"Skipping line index {i} ({line.get('Wavelength', 'N/A')} nm) due to invalid or non-positive numeric values.")
+                     continue
+
+                # Calculate y = ln( I * lambda_nm / (gk * Aki) )
+                factor = (intensity * wavelength_nm) / (gk * aki)
+                # Check factor validity and log non-finite results robustly
+                if not np.isfinite(factor) or factor <= 0:
+                    log.warning(f"Skipping line {wavelength_nm:.3f} nm: term inside log is non-positive or non-finite ({factor=}). Check I, lambda, gk, Aki.")
+                    continue
+
+                y_val = np.log(factor)
+                if not np.isfinite(y_val):
+                    log.warning(f"Skipping line {wavelength_nm:.3f} nm: Resulting y-value is non-finite. Check input data.")
+                    continue
+
+                boltzmann_x.append(ek_ev)
+                boltzmann_y.append(y_val)
+                valid_lines_info.append(f"{wavelength_nm:.1f}nm") # Store wavelength for potential annotation
+            except (ValueError, TypeError, KeyError, ZeroDivisionError) as e:
+                log.warning(f"Skipping line index {i} due to data error: {e}. Line data: {line}")
+                continue
+
+        if len(boltzmann_x) < min_lines_for_fit:
+            log.error(f"Insufficient valid lines ({len(boltzmann_x)}) remain after data check for {selected_species_str} (need {min_lines_for_fit}).")
+            messagebox.showerror("Error", f"Not enough valid lines found for {selected_species_str}\nafter data validation.", parent=self)
+            self.te_result_var.set("Error")
+            self.ax.set_title(f"Error: Need >= {min_lines_for_fit} valid lines")
+            self.canvas.draw_idle()
+            return
+
+        boltzmann_x = np.array(boltzmann_x)
+        boltzmann_y = np.array(boltzmann_y)
+
+        # 7. Perform linear regression using scipy.stats.linregress
+        try:
+            # Check for sufficient variation in X values
+            if np.std(boltzmann_x) < 1e-9:
+                log.error("Cannot perform linear regression: All E_k values are identical.")
+                messagebox.showerror("Calculation Error", "Cannot create Boltzmann plot: Upper energy levels (Ek) for the selected lines are identical.", parent=self)
+                self.te_result_var.set("Error")
+                self.ax.set_title("Error: Identical Ek values")
+                self.canvas.draw_idle()
+                return
+
+            slope, intercept, r_value, p_value, std_err = sp_stats.linregress(boltzmann_x, boltzmann_y)
+            r_sq = r_value**2
+        except Exception as e:
+            log.error(f"Linear regression failed for Boltzmann plot: {e}", exc_info=True)
+            messagebox.showerror("Calculation Error", "Linear regression for Boltzmann plot failed.", parent=self)
+            self.te_result_var.set("Error")
+            self.ax.set_title("Error: LinRegress failed")
+            self.canvas.draw_idle()
+            return
+
+        # 8. Calculate Temperature (Te) from slope
+        # Slope = -1 / (k_B_eV * Te)  => Te = -1 / (k_B_eV * slope)
+        if slope >= -1e-12 or not np.isfinite(slope): # Allow very small negative slope, check for NaN/Inf
+            log.error(f"Boltzmann plot slope is non-negative or non-finite ({slope=:.3e}). Cannot calculate Te.")
+            messagebox.showerror("Calculation Error", f"Boltzmann plot slope is invalid ({slope:.3e}).\nSlope must be negative.\nCheck line data and intensities.", parent=self)
+            Te_K = None
+            r_sq = np.nan
+            self.te_result_var.set("Error (Slope>=0)")
+        else:
+            Te_K = -1.0 / (k_B_eV * slope)
+            if not np.isfinite(Te_K) or Te_K <= 0:
+                 log.error(f"Calculated Te is invalid ({Te_K=}). Check slope value.")
+                 messagebox.showerror("Calculation Error", f"Calculated temperature is invalid ({Te_K:.1f} K).\nCheck input data and fit.", parent=self)
+                 Te_K = None
+                 self.te_result_var.set("Error (Invalid Te)")
+            else:
+                 self.plasma_params["Te"] = Te_K
+                 self.te_result_var.set(f"{Te_K:.0f} K (R²={r_sq:.3f})")
+                 log.info(f"Calculated Plasma Temperature (Te): {Te_K:.0f} K")
+                 log.info(f"Boltzmann Plot Fit: Slope={slope:.4f}, Intercept={intercept:.4f}, R-squared={r_sq:.4f}, StdErr={std_err:.4f}")
+
+
+        # 9. Plot the results
+        self.ax.clear()
+        # Create plot data including labels for hover/click events if desired
+        points = self.ax.scatter(boltzmann_x, boltzmann_y, label=f"{selected_species_str} data", marker='o', picker=5) # Enable picking points with tolerance
+
+        # Plot the fit line over the range of Ek values
+        if np.isfinite(slope) and np.isfinite(intercept):
+             ek_range_for_line = np.linspace(boltzmann_x.min(), boltzmann_x.max(), 10)
+             fit_y = intercept + slope * ek_range_for_line
+             self.ax.plot(ek_range_for_line, fit_y, color='red', linestyle='--', label=f'Fit (R²={r_sq:.3f})' if np.isfinite(r_sq) else 'Fit (R²=N/A)')
+        else:
+             log.warning("Fit parameters are invalid, cannot plot fit line.")
+
+        self.ax.set_xlabel("Upper Energy Level E$_k$ (eV)")
+        self.ax.set_ylabel("ln(I λ / g$_k$ A$_{ki}$) + Const") # Y-axis is relative
+        plot_title = f"Boltzmann Plot: {selected_species_str}"
+        if Te_K is not None:
+             plot_title += f"\nTe ≈ {Te_K:.0f} K"
+        else:
+             plot_title += f"\nCalculation Failed (Slope={slope:.3e})" if np.isfinite(slope) else "\nCalculation Failed"
+        self.ax.set_title(plot_title, fontsize=10)
+        self.ax.legend(fontsize=8)
+        self.ax.grid(True, linestyle=':')
+        # Add tooltips or annotations (Optional complex addition)
+        # tooltip = mplcursors.cursor(points, hover=True)
+        # @tooltip.connect("add")
+        # def on_add(sel):
+        #     sel.annotation.set(text=valid_lines_info[sel.index])
+        self.canvas.draw_idle()
+
+
+    def run_cf_libs_calculation(self):
+        """ Performs the core CF-LIBS calculation """
+        log.info("--- Starting CF-LIBS Concentration Calculation ---")
+        # Clear previous concentration results first
+        self.cf_results = {}
+        self.display_cf_results() # Show "No results"
+        self.update() # Force redraw
+
+        # 1. Validate Inputs (Te, Ne, Line Data, Element Params)
+        if not self.validate_cf_inputs():
+            log.error("Input validation failed. CF-LIBS calculation aborted.")
+            return
+
+        # Get validated Te and Ne (validation ensures they are positive floats)
+        Te_K = self.plasma_params["Te"]
+        Ne_cm3 = self.plasma_params["Ne"]
+        current_lines = self.line_data
+        element_params = self.elements_params # Already updated and validated partially
+
+        # --- Calculation Logic ---
+        elemental_signals = collections.defaultdict(float) # Stores sum(Proxy_s * U_s) for each element
+        species_log_Ns_over_Us_terms = collections.defaultdict(list) # Stores terms for averaging
+
+        # Step A: Calculate Log[ Ns / Us ] + C for each line using Boltzmann relation
+        for line in current_lines:
+            try:
+                element = line['Element']
+                stage = int(line['Stage'])
+                species_str = f"{element} {stage}"
+
+                I = float(line['Intensity'])
+                lambda_nm = float(line['Wavelength'])
+                gk = float(line['gk'])
+                Aki = float(line['Aki (s^-1)'])
+                Ek_eV = float(line['Ek (eV)'])
+
+                # Check necessary values again (though likely caught before)
+                if not all(isinstance(v, (int, float)) and v > 0 for v in [I, lambda_nm, gk, Aki]) or not (isinstance(Ek_eV, (int, float)) and Ek_eV >= 0):
+                     log.warning(f"Skipping line {lambda_nm:.3f} ({species_str}): Invalid numeric data during Ns/Us calculation.")
+                     continue
+
+                # Calculate Log term: ln(I * lambda_nm^3 / (gk * Aki)) + Ek_eV / (k_B_eV * Te_K)
+                # Using lambda_nm^3 form - includes physical constants in the resulting term.
+                term1_num = I * (lambda_nm**3) # Intensity * wavelength^3
+                term1_den = gk * Aki           # gk * Aki
+                if term1_num <= 0 or term1_den <= 0:
+                     log.warning(f"Skipping line {lambda_nm:.3f} ({species_str}): Non-positive term in log argument calculation.")
+                     continue
+
+                term1 = np.log(term1_num / term1_den)
+                term2 = Ek_eV / (k_B_eV * Te_K)
+
+                log_Ns_over_Us_proxy = term1 + term2
+
+                if not np.isfinite(log_Ns_over_Us_proxy):
+                    log.warning(f"Skipping line {lambda_nm:.3f} ({species_str}): Resulting log(Ns/Us) proxy is non-finite.")
+                    continue
+
+                species_log_Ns_over_Us_terms[species_str].append(log_Ns_over_Us_proxy)
+
+            except Exception as e:
+                log.warning(f"Error processing line {line.get('Wavelength', 'N/A')} for {species_str}: {e}. Skipping.")
+                continue
+
+        # Step B: Average Log[ Ns / Us ] terms for each species and calculate relative Ns/Us proxy
+        species_relative_Ns_over_Us = {}
+        processed_species_count = 0
+        for species_str, log_terms in species_log_Ns_over_Us_terms.items():
+            if log_terms:
+                 # Use median for robustness against outlier lines? Or mean? Mean is traditional.
+                 avg_log_term = np.mean(log_terms)
+                 # Calculate the relative proxy Ns/Us ~ exp(avg_log_term)
+                 relative_Ns_over_Us = np.exp(avg_log_term)
+                 species_relative_Ns_over_Us[species_str] = relative_Ns_over_Us
+                 log.debug(f"Species {species_str}: Avg Log[Ns/Us] Proxy = {avg_log_term:.4f}; Relative Ns/Us Proxy = {relative_Ns_over_Us:.3e}")
+                 processed_species_count += 1
+            else:
+                 log.warning(f"No valid terms calculated for species {species_str}, cannot determine its contribution.")
+
+        if processed_species_count == 0:
+            log.error("Could not process any species for relative number densities. Aborting.")
+            messagebox.showerror("Calculation Error", "Failed to calculate relative number densities for any species.", parent=self)
+            return
+
+        # Step C: Calculate total relative signal for each element using Saha equation implicitly
+        elements_present = sorted(list(set(line['Element'] for line in current_lines if line.get('Element'))))
+
+        for element in elements_present:
+            log.debug(f"Combining signals for element: {element}")
+            el_params = element_params.get(element, {})
+
+            # Get Partition functions and Ionization energies needed (already validated they exist if needed)
+            U_I = el_params.get('U_I')
+            U_II = el_params.get('U_II')
+            # U_III = el_params.get('U_III') # For higher stages if implemented
+            IE_I = el_params.get('IE_I')
+            IE_II = el_params.get('IE_II')
+
+            # Get the relative Ns/Us proxies
+            N_over_U_proxy_I = species_relative_Ns_over_Us.get(f"{element} 1", 0.0)
+            N_over_U_proxy_II = species_relative_Ns_over_Us.get(f"{element} 2", 0.0)
+            # N_over_U_proxy_III = ...
+
+            # Calculate Total Element Signal = Sum [ (Ns/Us)_proxy * Us ]
+            # This signal is proportional to the actual total number density of the element.
+            total_el_signal = 0.0
+            missing_info = False
+
+            if N_over_U_proxy_I > 0:
+                if U_I is not None and U_I > 0:
+                    total_el_signal += N_over_U_proxy_I * U_I
+                    log.debug(f"  {element}: Stage I contribution = {N_over_U_proxy_I * U_I:.3e} (Proxy={N_over_U_proxy_I:.3e}, U={U_I})")
+                else:
+                    log.warning(f"  {element}: Cannot include Stage I contribution, missing valid U_I ({U_I=}).")
+                    missing_info = True
+
+            if N_over_U_proxy_II > 0:
+                if U_II is not None and U_II > 0:
+                    total_el_signal += N_over_U_proxy_II * U_II
+                    log.debug(f"  {element}: Stage II contribution = {N_over_U_proxy_II * U_II:.3e} (Proxy={N_over_U_proxy_II:.3e}, U={U_II})")
+                else:
+                    log.warning(f"  {element}: Cannot include Stage II contribution, missing valid U_II ({U_II=}).")
+                    missing_info = True
+
+            # Add higher stages here if implemented
+
+            if missing_info:
+                 log.error(f"Element {element}: Cannot accurately calculate total signal due to missing partition functions. Result may be inaccurate.")
+                 # Decide whether to proceed or stop? For demo, proceed but warn.
+                 # messagebox.showwarning("Missing Data", f"Calculation for {element} might be inaccurate due to missing U values.", parent=self)
+
+            if total_el_signal > 0:
+                elemental_signals[element] = total_el_signal
+                log.info(f"  Element {element}: Total Relative Signal = {total_el_signal:.4e}")
+            else:
+                 log.warning(f"  Element {element}: Calculated total signal is zero or negative. Excluding from concentration result.")
+
+
+        # Step D: Normalize elemental signals to find concentrations (%)
+        total_signal_all_elements = sum(elemental_signals.values())
+        log.info(f"Total signal sum across all elements: {total_signal_all_elements:.4e}")
+
+        if total_signal_all_elements <= 0:
+             log.error("Total signal is zero or negative. Cannot calculate concentrations.")
+             messagebox.showerror("Calculation Error", "Total signal calculated is zero or negative.\nCannot determine concentrations.", parent=self)
+             self.cf_results = {}
+        else:
+             # Store concentrations
+             self.cf_results = {el: (sig / total_signal_all_elements) * 100.0
+                                for el, sig in elemental_signals.items() if sig > 0} # Only include elements with signal
+
+             log.info("--- Calculated Elemental Concentrations (%) ---")
+             if not self.cf_results:
+                 log.warning("  No elements had a positive signal contribution.")
+             else:
+                 # Sort by concentration for logging
+                 for el, conc in sorted(self.cf_results.items(), key=lambda item: item[1], reverse=True):
+                      log.info(f"  {el:<5}: {conc:>8.4f} %")
+                 log.info(f"  Sum: {sum(self.cf_results.values()):.2f} %") # Should be 100.00
+             log.info("---------------------------------------------")
+
+
+        # Display results in the GUI
+        self.display_cf_results()
+
+
+    def validate_cf_inputs(self) -> bool:
+        """ Checks if all necessary inputs for CF-LIBS calc are available and valid """
+        error_messages = []
+
+        # 1. Check Te
+        te_val = self.plasma_params.get("Te")
+        if te_val is None or not isinstance(te_val, (int, float)) or te_val <= 0:
+            error_messages.append("Plasma Temperature (Te) must be calculated first using Boltzmann Plot and be > 0.")
+            log.error("Validation failed: Invalid Te.")
+        else:
+            log.debug(f"Using Te = {te_val:.0f} K")
+
+        # 2. Check Ne
+        try:
+            ne_val = float(self.ne_var.get())
+            if not (isinstance(ne_val, (int, float)) and ne_val > 0):
+                raise ValueError("Ne must be positive")
+            self.plasma_params["Ne"] = ne_val # Store the validated value only if it's valid
+            log.debug(f"Using Electron Density (Ne) = {ne_val:.3e} cm⁻³")
+        except (ValueError, TypeError):
+            error_messages.append(f"Invalid Electron Density (Ne) entered: '{self.ne_var.get()}'. Must be a positive number.")
+            log.error(f"Validation failed: Invalid Ne input: {self.ne_var.get()}")
+            self.plasma_params["Ne"] = None # Invalidate stored Ne
+
+        # 3. Check Line Data
+        if not self.line_data:
+             error_messages.append("No spectral line data loaded.")
+             log.error("Validation failed: No line data.")
+
+        # 4. Check Element Parameters (IE, U) - Update from GUI first
+        if not self.update_element_params_from_gui():
+             error_messages.append("Failed to read or validate element parameters from GUI input fields.")
+             log.error("Validation failed: Element parameter GUI update failed.")
+             # Don't proceed with element param checks if reading failed
+
+        else: # Only check element params content if reading them worked
+             elements_in_lines = set(line.get('Element','').strip() for line in self.line_data if line.get('Element','').strip())
+             required_stages = collections.defaultdict(set)
+             for line in self.line_data:
+                 el = line.get('Element','').strip()
+                 st = line.get('Stage')
+                 if el and isinstance(st, int) and st >= 1:
+                    required_stages[el].add(st)
+
+             for el in elements_in_lines:
+                 params = self.elements_params.get(el, {})
+                 stages = required_stages.get(el, set())
+
+                 # Check U_I if any stage 1 line exists (or any line exists for the element)
+                 if 1 in stages or stages: # If stage 1 exists or *any* stage exists, U_I is needed
+                    u_i = params.get('U_I')
+                    if u_i is None or not (isinstance(u_i, (int, float)) and u_i > 0):
+                         error_messages.append(f"Element {el}: Missing or invalid Partition Function U_I (> 0).")
+
+                 # Check U_II and IE_I if any stage 2 line exists
+                 if 2 in stages:
+                    u_ii = params.get('U_II')
+                    ie_i = params.get('IE_I')
+                    if ie_i is None or not (isinstance(ie_i, (int, float)) and ie_i > 0):
+                         error_messages.append(f"Element {el}: Missing or invalid Ionization Energy IE_I (> 0) (needed for Stage 2).")
+                    if u_ii is None or not (isinstance(u_ii, (int, float)) and u_ii > 0):
+                         error_messages.append(f"Element {el}: Missing or invalid Partition Function U_II (> 0) (needed for Stage 2).")
+
+                 # Add checks for U_III, IE_II if stage 3 lines exist etc.
+
+        if error_messages:
+             log.error("Input validation for CF-LIBS failed:")
+             for i, msg in enumerate(error_messages): log.error(f"  {i+1}. {msg}")
+             messagebox.showerror("Validation Failed", "Cannot proceed with CF-LIBS calculation due to missing or invalid inputs:\n\n- " + "\n- ".join(error_messages), parent=self)
+             return False
+
+        log.info("All necessary inputs for CF-LIBS validated.")
+        return True
+
+    def display_cf_results(self):
+         """ Updates the concentration result labels in the GUI """
+         # Clear previous results first
+         for widget in self.concentration_frame.winfo_children():
+              widget.destroy()
+
+         if not self.cf_results:
+              ttk.Label(self.concentration_frame, text="Concentrations will appear here.").pack(anchor='w')
+              return
+
+         ttk.Label(self.concentration_frame, text="Concentrations (%):", font='TkDefaultFont 9 bold').pack(anchor='w', pady=(5,2))
+
+         # Sort elements by concentration (descending) for display
+         sorted_results = sorted(self.cf_results.items(), key=lambda item: item[1], reverse=True)
+
+         # Use a frame for grid layout inside the pack layout
+         result_grid = ttk.Frame(self.concentration_frame)
+         result_grid.pack(fill='x')
+
+         max_rows = 10 # Limit rows shown directly, add scroll if more?
+         for i, (element, concentration) in enumerate(sorted_results):
+              if i >= max_rows:
+                   ttk.Label(result_grid, text=f"  ... and {len(sorted_results)-max_rows} more ...").grid(row=i, column=0, columnspan=2, sticky='w')
+                   break
+              ttk.Label(result_grid, text=f"  {element}:").grid(row=i, column=0, sticky='w', padx=(0,5))
+              ttk.Label(result_grid, text=f"{concentration:>8.4f} %").grid(row=i, column=1, sticky='w')
+
+    # --- GUI Callbacks ---
+
+    def quit_app(self):
+        """ Closes the application """
+        log.info("--- Exiting CF-LIBS Demo ---")
+        # Cleanly remove the handler to avoid potential issues on exit
+        if hasattr(self, 'log_handler'):
+            log.removeHandler(self.log_handler)
+            self.log_handler.close() # Close the handler
+        logging.shutdown() # Ensure logs flushed
+
+        # Attempt to cleanly destroy the window and exit
+        try:
+            self.destroy()
+        except tk.TclError as e:
+             log.debug(f"Ignoring error during destroy: {e}")
+             pass
+        # sys.exit() # Usually not needed if destroy works
+
+# --- Custom Dialog for Line Input ---
+class LineInputDialog(simpledialog.Dialog):
+    # Allows modification for input validation if needed
+    def __init__(self, parent, title=None, initial_data=None):
+        self.initial_data = initial_data if initial_data else {}
+        self.validators = { # Add simple validation types if desired
+             "Stage": int, "Wavelength": float, "Intensity": float,
+             "Ek (eV)": float, "gk": float, "Aki (s^-1)": float
+        }
+        super().__init__(parent, title=title)
+
+    def body(self, master):
+        self.entries = {}
+        fields = ["Element", "Stage", "Wavelength", "Intensity", "Ek (eV)", "gk", "Aki (s^-1)"]
+        defaults = { # Provide some reasonable defaults/hints
+             "Element": "Fe", "Stage": "1", "Wavelength": "400.0", "Intensity": "1.0e4",
+             "Ek (eV)": "3.0", "gk": "5.0", "Aki (s^-1)": "1.0e7"
+        }
+
+        container = ttk.Frame(master)
+        for i, field in enumerate(fields):
+            ttk.Label(container, text=f"{field}:").grid(row=i, column=0, sticky='w', padx=5, pady=3)
+            var = tk.StringVar()
+            # Use initial data if provided, otherwise use default string
+            initial_val_str = str(self.initial_data.get(field, defaults.get(field, "")))
+            var.set(initial_val_str)
+            entry = ttk.Entry(container, textvariable=var, width=25) # Wider entry
+            entry.grid(row=i, column=1, sticky='ew', padx=5, pady=3)
+            self.entries[field] = var
+            if i == 0: entry.focus_set() # Focus on first field
+
+        container.grid_columnconfigure(1, weight=1) # Allow entry to expand
+        container.pack(fill='x', expand=True, padx=5, pady=5)
+        return self.entries["Element"] # Return focus element
+
+    def validate(self):
+        # Perform validation before closing the dialog
+        temp_results = {}
+        for field, var in self.entries.items():
+            val_str = var.get().strip()
+            if not val_str and field != "Element": # Allow empty Element? Maybe not. Make req?
+                # Handle optional fields later if needed
+                pass
+            if field in self.validators:
+                try:
+                    # Specific checks
+                    val = self.validators[field](val_str)
+                    if field == "Stage" and val < 1: raise ValueError("Stage must be >= 1")
+                    if field == "Wavelength" and val <= 0: raise ValueError("Wavelength must be > 0")
+                    if field == "Intensity" and val <= 0: raise ValueError("Intensity must be > 0")
+                    if field == "gk" and val <= 0: raise ValueError("gk must be > 0")
+                    if field == "Aki (s^-1)" and val <= 0: raise ValueError("Aki must be > 0")
+                    if field == "Ek (eV)" and val < 0: raise ValueError("Ek must be >= 0")
+                    temp_results[field] = val # Store validated value if needed later
+                except (ValueError, TypeError) as e:
+                    messagebox.showwarning("Validation Error", f"Invalid value for '{field}':\n{val_str}\n({e})", parent=self)
+                    return 0 # Validation failed
+            elif field == "Element":
+                if not val_str:
+                     messagebox.showwarning("Validation Error", "Element symbol cannot be empty.", parent=self)
+                     return 0
+        return 1 # Validation successful
+
+    def apply(self):
+        # Assumes validation passed
+        self.result = {field: var.get() for field, var in self.entries.items()}
+
+
+# --- Custom Dialog for Species Selection ---
+class SelectSpeciesDialog(simpledialog.Dialog):
+    def __init__(self, parent, title=None, options=None):
+        self.options = options if options else ["N/A"]
+        self.selection = tk.StringVar()
+        super().__init__(parent, title=title)
+
+    def body(self, master):
+        container = ttk.Frame(master)
+        ttk.Label(container, text="Select species for Boltzmann Plot:").pack(pady=5)
+        # Set default selection if possible
+        if self.options and self.options[0] != "N/A":
+             self.selection.set(self.options[0])
+        else:
+             self.selection.set("N/A")
+
+        self.combobox = ttk.Combobox(container, textvariable=self.selection, values=self.options, state="readonly", width=25)
+        if not self.options or self.options[0] == "N/A":
+             self.combobox.configure(state=tk.DISABLED) # Disable if no options
+        self.combobox.pack(pady=5, padx=10)
+        container.pack(fill='x', expand=True, padx=5, pady=5)
+        return self.combobox # initial focus
+
+    def validate(self):
+        if self.selection.get() == "N/A":
+            messagebox.showwarning("No Selection", "Please select a valid species.", parent=self)
+            return 0
+        return 1
+
+    def apply(self):
+        self.result = self.selection.get()
+
+
+# --- Run Application ---
+if __name__ == "__main__":
+    # Essential dependency checks at start
+    if not _MATPLOTLIB_AVAILABLE:
+         print("CRITICAL ERROR: Matplotlib is required for this GUI demo.")
+         print("Please install it using: pip install matplotlib")
+         sys.exit(1)
+    if not _SCIPY_AVAILABLE:
+         print("CRITICAL ERROR: SciPy is required for this GUI demo (for Boltzmann plot fit).")
+         print("Please install it using: pip install scipy")
+         sys.exit(1)
+
+    # Set high DPI awareness on Windows for better scaling (optional)
+    try:
+        from ctypes import windll
+        windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        pass # Ignore if not on Windows or other OS, or fails
+
+    # Run the App
+    app = CFLIBSDemoApp()
+    try:
+        app.mainloop()
+    except Exception as e:
+         # Catch unexpected errors during mainloop if possible
+         print(f"An unexpected error occurred in the main application loop: {e}")
+         logging.exception("Unexpected error in mainloop:")
+         logging.shutdown() # Ensure logs flushed
+         sys.exit(1)
+
+# === FILE END: cf_libs_demo_gui.py ===
